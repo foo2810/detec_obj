@@ -15,10 +15,15 @@ import torchvision
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
 from utils.data_loader import coco2dataframe, OBDataset
+from utils.metrics import mAP
 
 import json
 import time
 import numpy as np
+
+import os
+os.environ['http_proxy'] = 'http://ufproxy.b.cii.u-fukui.ac.jp:8080'
+os.environ['https_proxy'] = 'http://ufproxy.b.cii.u-fukui.ac.jp:8080'
 
 def collate_fn(batch):
     return tuple(zip(*batch))
@@ -33,11 +38,11 @@ if __name__ == '__main__':
     img_ids = annots['image_id'].tolist()
     images = images.query('id in {}'.format(img_ids))
     p = np.random.permutation(len(images))
-    train_ds = OBDataset(images.take(p).iloc[:50], annots)
-    test_ds = OBDataset(images.take(p).iloc[50:60], annots)
+    train_ds = OBDataset(images.take(p).iloc[:100], annots)
+    test_ds = OBDataset(images.take(p).iloc[1000:1010], annots)
 
     train_loader = torch.utils.data.DataLoader(
-        train_ds, batch_size=2, shuffle=True, num_workers=1,
+        train_ds, batch_size=5, shuffle=True, num_workers=1,
         collate_fn=collate_fn)
     test_loader = torch.utils.data.DataLoader(
         test_ds, batch_size=2, shuffle=False, num_workers=1,
@@ -45,21 +50,22 @@ if __name__ == '__main__':
 
     
     # Model
+    num_classes = 12  # 1 class (person) + background
+
     # load a model pre-trained pre-trained on COCO
     model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
-    
-    # replace the classifier with a new one, that has
-    # num_classes which is user-defined
-    num_classes = 12  # 1 class (person) + background
-    # get number of input features for the classifier
     in_features = model.roi_heads.box_predictor.cls_score.in_features
-    # replace the pre-trained head with a new one
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+
+    # backbone = torchvision.models.vgg16_bn(pretrained=True).features
+    # backbone.out_channels = 512
+    # anchor_generator = torchvision.models.detection.rpn.AnchorGenerator(sizes=((32, 64, 128, 256, 512),), aspect_ratios=((0.5, 1.0, 2.0),))
+    # model = torchvision.models.detection.FasterRCNN(backbone, num_classes=num_classes, rpn_anchor_generator=anchor_generator)
 
 
     # Train
     params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(params, lr=0.005)
+    optimizer = torch.optim.Adam(params, lr=0.0001)
     n_epochs = 10
 
     torch.cuda.empty_cache()
@@ -67,11 +73,10 @@ if __name__ == '__main__':
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu') 
     model = model.to(device)
 
-    model.train()
     for epoch in range(n_epochs):
-
         stime = time.perf_counter()
         train_loss = 0
+        model.train()
         for i, batch in enumerate(train_loader):
             images, targets = batch
 
@@ -87,19 +92,30 @@ if __name__ == '__main__':
             optimizer.zero_grad()
             losses.backward()
             optimizer.step()
+            del images, targets
 
         train_loss /= len(train_loader.dataset)
 
-        print('Epoch[{}/{}] time: {:.4f}, loss: {}'.format(epoch+1, n_epochs, time.perf_counter()-stime, train_loss))
+        model.eval()
+        for i, batch in enumerate(train_loader):
+            images, targets = batch
 
+            images = list(image.to(device) for image in images)
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-    # model.eval()
-    # for i, batch in enumerate(test_loader):
-    #     images, targets = batch
+            with torch.no_grad():
+                output = model(images)
+                mAPs = []
+                for out, gt in zip(output, targets):
+                    boxes_gt = gt['boxes']
+                    labels_gt = gt['labels']
+                    boxes_pred = out['boxes']
+                    labels_pred = out['labels']
+                    scores_pred = out['scores']
+                    threshold = 0.5
+                    interpolated = False
+                    mAPs += [mAP(boxes_gt, labels_gt, boxes_pred, labels_pred, scores_pred, num_classes, threshold, interpolated)]
+                mAPs = np.array(mAPs)
+                mmAP = np.mean(mAPs)
 
-    #     images = list(image.to(device) for image in images)
-    #     targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-
-    #     with torch.no_grad():
-    #         output = model(images)
-    #         print(output)
+        print('Epoch[{}/{}] time: {:.4f}, loss: {}, test_mean_mAP: {}, test_mAP: {}'.format(epoch+1, n_epochs, time.perf_counter()-stime, train_loss, mmAP, mAPs))
