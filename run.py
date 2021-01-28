@@ -16,7 +16,7 @@ from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
 from utils.data_loader import coco2dataframe, OBDataset
 from utils.metrics import mAP
-from utils.transforms import ToTensor, RandomHorizontalFlip, Compose
+from utils.transforms import ToTensor, Resize, RandomHorizontalFlip, Compose
 
 import json
 import time
@@ -29,7 +29,8 @@ os.environ['https_proxy'] = 'http://ufproxy.b.cii.u-fukui.ac.jp:8080'
 def collate_fn(batch):
     return tuple(zip(*batch))
 
-transforms = Compose([RandomHorizontalFlip(0.5)])
+transforms_train = Compose([Resize(1/8), RandomHorizontalFlip(0.5)])
+transforms_test = Compose([Resize(1/8)])
 
 if __name__ == '__main__':
     # Dataset
@@ -51,8 +52,8 @@ if __name__ == '__main__':
     # shuffle
     p = np.random.permutation(len(images))
     N = 200
-    train_ds = OBDataset(images.take(p).iloc[:N], annots, transforms=transforms)
-    test_ds = OBDataset(images.take(p).iloc[N:N+N], annots)
+    train_ds = OBDataset(images.take(p).iloc[:N], annots, transforms=transforms_train)
+    test_ds = OBDataset(images.take(p).iloc[N:N+N], annots, transforms=transforms_test)
     print(f'Train: {len(train_ds)}')
     print(f'Test: {len(test_ds)}')
 

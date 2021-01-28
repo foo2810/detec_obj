@@ -42,6 +42,17 @@ class RandomHorizontalFlip(object):
                 target["keypoints"] = keypoints
         return image, target
 
+class Resize(object):
+    def __init__(self, rate):
+        self.rate = rate
+    
+    def __call__(self, image, target):
+        _, w, h = image.size()
+        image = F.resize(image, (int(w*self.rate), int(h*self.rate)))
+        target['boxes'] = target['boxes']*self.rate
+
+        return image, target
+
 
 class ToTensor(object):
     def __call__(self, image, target):
