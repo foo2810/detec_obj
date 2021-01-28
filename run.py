@@ -16,6 +16,7 @@ from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
 from utils.data_loader import coco2dataframe, OBDataset
 from utils.metrics import mAP
+from utils.transforms import ToTensor, RandomHorizontalFlip, Compose
 
 import json
 import time
@@ -28,21 +29,35 @@ os.environ['https_proxy'] = 'http://ufproxy.b.cii.u-fukui.ac.jp:8080'
 def collate_fn(batch):
     return tuple(zip(*batch))
 
+transforms = Compose([RandomHorizontalFlip(0.5)])
+
 if __name__ == '__main__':
     # Dataset
     with open('data/coco_annotations.json', 'r') as fp:
         coco_annot = json.load(fp)
 
     images, annots = coco2dataframe(coco_annot)
+
     # bounding_boxが存在しない画像があるっぽいのでそれらを除去
     img_ids = annots['image_id'].tolist()
     images = images.query('id in {}'.format(img_ids))
+
+    # 予測対象のJumper SchoolとBreezer Schoolに限定
+    # 'bg': 0, 'Jumper School': 1, 'Breezer School': 2,
+    annots = annots.query('category_id in [0, 1, 2]')
+    img_ids = annots['image_id'].tolist()
+    images = images.query('id in {}'.format(img_ids))
+
+    # shuffle
     p = np.random.permutation(len(images))
-    train_ds = OBDataset(images.take(p).iloc[:100], annots)
-    test_ds = OBDataset(images.take(p).iloc[1000:1010], annots)
+    N = 200
+    train_ds = OBDataset(images.take(p).iloc[:N], annots, transforms=transforms)
+    test_ds = OBDataset(images.take(p).iloc[N:N+N], annots)
+    print(f'Train: {len(train_ds)}')
+    print(f'Test: {len(test_ds)}')
 
     train_loader = torch.utils.data.DataLoader(
-        train_ds, batch_size=5, shuffle=True, num_workers=1,
+        train_ds, batch_size=2, shuffle=True, num_workers=1,
         collate_fn=collate_fn)
     test_loader = torch.utils.data.DataLoader(
         test_ds, batch_size=2, shuffle=False, num_workers=1,
@@ -50,22 +65,27 @@ if __name__ == '__main__':
 
     
     # Model
-    num_classes = 12  # 1 class (person) + background
+    num_classes = 3  # 2 class (targets) + background
 
     # load a model pre-trained pre-trained on COCO
     model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
 
-    # backbone = torchvision.models.vgg16_bn(pretrained=True).features
-    # backbone.out_channels = 512
+    # backbone = torchvision.models.mobilenet_v2(pretrained=True).features
+    # backbone.out_channels = 1280
     # anchor_generator = torchvision.models.detection.rpn.AnchorGenerator(sizes=((32, 64, 128, 256, 512),), aspect_ratios=((0.5, 1.0, 2.0),))
-    # model = torchvision.models.detection.FasterRCNN(backbone, num_classes=num_classes, rpn_anchor_generator=anchor_generator)
+    # # anchor_generator = torchvision.models.detection.rpn.AnchorGenerator(sizes=((32,), (64,), (128,), (256,), (512),), aspect_ratios=((0.5, 1.0, 2.0),)*5)
+    # roi_pooler =torchvision.ops.MultiScaleRoIAlign(
+    #     featmap_names=['0','1','2','3'],
+    #     output_size=7,
+    #     sampling_ratio=2)
+    # model = torchvision.models.detection.FasterRCNN(backbone, num_classes=num_classes, rpn_anchor_generator=anchor_generator, box_roi_pool=roi_pooler)
 
 
     # Train
     params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(params, lr=0.0001)
+    optimizer = torch.optim.Adam(params, lr=0.001)
     n_epochs = 10
 
     torch.cuda.empty_cache()
@@ -92,7 +112,6 @@ if __name__ == '__main__':
             optimizer.zero_grad()
             losses.backward()
             optimizer.step()
-            del images, targets
 
         train_loss /= len(train_loader.dataset)
 
@@ -113,7 +132,7 @@ if __name__ == '__main__':
                     labels_pred = out['labels']
                     scores_pred = out['scores']
                     threshold = 0.5
-                    interpolated = False
+                    interpolated = True
                     mAPs += [mAP(boxes_gt, labels_gt, boxes_pred, labels_pred, scores_pred, num_classes, threshold, interpolated)]
                 mAPs = np.array(mAPs)
                 mmAP = np.mean(mAPs)
