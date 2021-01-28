@@ -42,8 +42,7 @@ class OBDataset(torch.utils.data.Dataset):
         img_info = self.img_infos.iloc[idx]
         img_id = img_info['id']
         img_fname = img_info['file_name']
-        img = torch.tensor(np.array(Image.open(img_fname)).transpose([2, 1, 0]) / 255, dtype=torch.float)
-
+        img = Image.open(img_fname)
         target_annots = self.annots.query(f'image_id == {img_id}')
         if len(target_annots) == 0:
             print(' >>> Warning: target_annots is empty (img_id: {})'.format(img_id))
