@@ -136,7 +136,7 @@ def _ap_per_class_base(boxes_gt: torch.Tensor, labels_gt: torch.Tensor, boxes_pr
 
     assert torch.all(labels_pred == labels_pred[0])
 
-    p = torch.argsort(scores_pred)
+    p = torch.argsort(scores_pred, descending=True)
     mask = labels_gt == labels_pred[0]
     is_correct = torch.zeros(len(labels_pred), dtype=torch.bool)
     for bb_gt in boxes_gt[mask]:
