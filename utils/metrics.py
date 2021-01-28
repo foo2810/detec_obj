@@ -1,15 +1,82 @@
+# Refs: https://github.com/rafaelpadilla/Object-Detection-Metrics/blob/master/lib/Evaluator.py
+
 import torch
 
-def iou(ground_truth, pred):
+from typing import Tuple
+
+def _boxes_intersect(box_a: torch.Tensor, box_b: torch.Tensor) -> bool:
+    """
+    二つのbounding_boxが重なっているかを判定
+
+    Parameters
+    ----------
+    box_a, box_b: torch.Tensor
+
+    Returns
+    -------
+    flg: bool
+    """
+
+    if box_a[0] > box_b[2]:
+        return False  # box_a is right of box_b
+    if box_b[0] > box_a[2]:
+        return False  # box_a is left of box_b
+    if box_a[3] < box_b[1]:
+        return False  # box_a is above box_b
+    if box_a[1] > box_b[3]:
+        return False  # box_a is below box_b
+
+    return True
+
+def _get_intersect_area(box_a: torch.Tensor, box_b: torch.Tensor):
+    """
+    重なっている面積を計算(積集合)
+
+    Parameters
+    ----------
+    box_a, box_b: torch.Tensor
+
+    Returns
+    -------
+    area:
+    """
+
+    x_a = max(box_a[0], box_b[0])
+    y_a = max(box_a[1], box_b[1])
+    x_b = min(box_a[2], box_b[2])
+    y_b = min(box_a[3], box_b[3])
+    # intersection area
+    return (x_b - x_a + 1) * (y_b - y_a + 1)
+
+def _get_union_area(box_a: torch.Tensor, box_b: torch.Tensor):
+    """
+    box_aとbox_bを合わせた面積を計算(和集合)
+
+    Parameters
+    ----------
+    box_a, box_b: torch.Tensor
+
+    Returns
+    -------
+    area:
+    """
+
+    s_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    s_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+    area = s_a + s_b - _get_intersect_area(box_a, box_b)
+
+    return area
+
+def iou(box_gt: torch.Tensor, box_pred: torch.Tensor):
     """
     IOUを計算
 
     Parameters
     ----------
-    ground_truth:
+    box_gt:
         正解bounding_box
     
-    pred
+    box_pred:
         予測bounding_box
     
     Returns
@@ -18,4 +85,264 @@ def iou(ground_truth, pred):
         IOU
     """
 
-    ...
+    if _boxes_intersect(box_gt, box_pred):
+        return _get_intersect_area(box_gt, box_pred) / _get_union_area(box_gt, box_pred)
+    else:
+        return 0
+
+def _ap_per_class_base(boxes_gt: torch.Tensor, labels_gt: torch.Tensor, boxes_pred: torch.Tensor, labels_pred: torch.Tensor, scores_pred: torch.Tensor, iou_threshold: float=0.5) -> Tuple[torch.Tensor]:
+    """
+    一つのクラスに対するPrecisionとRecallを計算
+
+    Parameters
+    ----------
+    boxes_gt: torch.Tensor
+        正解bounding_box (2 dims)
+        バッチ内のすべてのbounding_boxを指定(クラスによらない)
+
+    labels_gt: torch.Tensor
+        正解ラベル (1 dims)
+        バッチ内のすべてのlabels指定(クラスによらない)
+
+    boxes_pred: torch.Tensor
+        予測bounding_box (2 dims)
+        一種類の予測クラスのみの予測bounding_boxを指定する
+
+    labels_pred: torch.Tensor
+        予測ラベル (1 dims)
+        一種類の予測クラスのみのlabelsを指定する
+        (便宜的にテンソルを指定するようにしている)
+    
+    scores_pred: torch.Tensor
+        予測信頼度 (1 dims)
+        一種類の予測クラスのみのscoresを指定する
+    
+    iou_threshold: float
+        iou threshold
+
+    Returns
+    -------
+    precisin, recall, is_correct: Tuple[torch.Tensor]
+        予測信頼度順で並べられたPrecisionとRecallと正否
+        (補完実行前)
+    """
+
+    if len(labels_pred) == 0:
+        return torch.zeros(1, dtype=torch.float), torch.zeros(1, dtype=torch.float), torch.zeros(1, dtype=torch.bool)
+
+    assert torch.all(labels_pred == labels_pred[0])
+
+    p = torch.argsort(scores_pred)
+    # batched_iou = torch.vmap(iou)
+    # ious = batched_iou(boxes_gt, boxes_pred)
+    ious = []
+    for bb_pred in boxes_pred:
+        max_iou = 1e-12
+        for bb_gt in boxes_gt:
+            out_t = iou(bb_gt, bb_pred)
+            if max_iou < out_t:
+                max_iou = out_t
+        ious += [max_iou]
+    ious = torch.tensor(ious, dtype=torch.float)
+
+    is_correct = ious > iou_threshold
+    corrects = (is_correct).long()
+
+    masks = [torch.tensor([j for j in range(i+1)], dtype=torch.long) for i in range(labels_pred)]
+    n_gts = torch.long(labels_gt == labels_pred[0]).sum().item()
+
+    precisions = []
+    recalls = []
+    for mask in masks:
+        precisions += [torch.sum(corrects[p][mask]).item() / len(mask)]
+        recalls += [torch.sum(corrects[p][mask]).item() / n_gts]
+
+    precisions = torch.tensor(precisions)
+    recalls = torch.tensor(recalls)
+
+    return precisions, recalls, is_correct[p]
+
+
+def ap_per_class(boxes_gt: torch.Tensor, labels_gt: torch.Tensor, boxes_pred: torch.Tensor, labels_pred: torch.Tensor, scores_pred: torch.Tensor, iou_threshold: float=0.5) -> float:
+    """
+    一つのクラスに対するAverage Precisionを計算
+    not 11-point interpolated average precision
+
+    Parameters
+    ----------
+    boxes_gt: torch.Tensor
+        正解bounding_box (2 dims)
+        バッチ内のすべてのbounding_boxを指定(クラスによらない)
+
+    labels_gt: torch.Tensor
+        正解ラベル (1 dims)
+        バッチ内のすべてのlabels指定(クラスによらない)
+
+    boxes_pred: torch.Tensor
+        予測bounding_box (2 dims)
+        一種類の予測クラスのみの予測bounding_boxを指定する
+
+    labels_pred: torch.Tensor
+        予測ラベル (1 dims)
+        一種類の予測クラスのみのlabelsを指定する
+        (便宜的にテンソルを指定するようにしている)
+    
+    scores_pred: torch.Tensor
+        予測信頼度 (1 dims)
+        一種類の予測クラスのみのscoresを指定する
+
+    iou_threshold: float
+        iou threshold
+
+    Returns
+    -------
+    ap: float
+        Average Precision
+    """
+
+    precisions, _, is_correct = _ap_per_class_base(boxes_gt, labels_gt, boxes_pred, labels_pred, scores_pred, iou_threshold)
+    ap = precisions[is_correct].mean().item()
+    return ap
+
+def ap_interpolated_per_class(boxes_gt: torch.Tensor, labels_gt: torch.Tensor, boxes_pred: torch.Tensor, labels_pred: torch.Tensor, scores_pred: torch.Tensor, iou_threshold: float=0.5) -> float:
+    """
+    一つのクラスに対するAverage Precisionを計算
+    11-point interpolated average precision
+
+    Parameters
+    ----------
+    boxes_gt: torch.Tensor
+        正解bounding_box (2 dims)
+        バッチ内のすべてのbounding_boxを指定(クラスによらない)
+
+    labels_gt: torch.Tensor
+        正解ラベル (1 dims)
+        バッチ内のすべてのlabels指定(クラスによらない)
+
+    boxes_pred: torch.Tensor
+        予測bounding_box (2 dims)
+        一種類の予測クラスのみの予測bounding_boxを指定する
+
+    labels_pred: torch.Tensor
+        予測ラベル (1 dims)
+        一種類の予測クラスのみのlabelsを指定する
+        (便宜的にテンソルを指定するようにしている)
+    
+    scores_pred: torch.Tensor
+        予測信頼度 (1 dims)
+        一種類の予測クラスのみのscoresを指定する
+
+    iou_threshold: float
+        iou threshold
+
+    Returns
+    -------
+    ap_interpolated: float
+        Interpolated Average Precision
+    """
+
+    precisions, recalls, _= _ap_per_class_base(boxes_gt, labels_gt, boxes_pred, labels_pred, scores_pred, iou_threshold)
+
+    # Interpolate
+    precisions_interpolated = precisions.clone()
+    max_prec = precisions[-1]
+    for i in range(len(recalls)-1, -1, -1):
+        precisions_interpolated[i] = torch.maximum(precisions[i], max_prec)
+        max_prec = precisions_interpolated[i]
+    
+    eleven_points_prec = []
+    for i, r in enumerate(torch.arange(0, 1.1, 0.1)):
+        for j, rec in enumerate(recalls):
+            if r <= rec:
+                eleven_points_prec += [precisions_interpolated[j]]
+                break
+    eleven_points_prec = torch.tensor(eleven_points_prec)
+    ap_interpolated = eleven_points_prec.mean().item()
+
+    return ap_interpolated
+
+def AP(boxes_gt: torch.Tensor, labels_gt: torch.Tensor, boxes_pred: torch.Tensor, labels_pred: torch.Tensor, scores_pred: torch.Tensor, num_classes: int, iou_threshold: float=0.5, interpolate: bool=False) -> torch.Tensor:
+    """
+    全クラスに対するAverage Precisionを計算
+
+    Parameters
+    ----------
+    boxes_gt: torch.Tensor
+        正解bounding_box (2 dims)
+        バッチ内のすべてのbounding_boxを指定(クラスによらない)
+
+    labels_gt: torch.Tensor
+        正解ラベル (1 dims)
+        バッチ内のすべてのlabels指定(クラスによらない)
+
+    boxes_pred: torch.Tensor
+        予測bounding_box (2 dims)
+
+    labels_pred: torch.Tensor
+        予測ラベル (1 dims)
+    
+    scores_pred: torch.Tensor
+        予測信頼度 (1 dims)
+    
+    iou_threshold: float
+        iou threshold
+    
+    interpolate: bool
+        11点補完をするかどうか
+
+    Returns
+    -------
+    aps: torch.Tensor
+        Average Precisions for every classes
+    """
+
+    aps = []
+    for c in range(num_classes):
+        mask = labels_pred == c
+        if interpolate:
+            ap_c = ap_interpolated_per_class(boxes_gt, labels_gt, boxes_pred[mask], labels_pred[mask], scores_pred[mask], iou_threshold)
+        else:
+            ap_c = ap_per_class(boxes_gt, labels_gt, boxes_pred[mask], labels_pred[mask], scores_pred[mask], iou_threshold)
+        aps += [ap_c]
+
+    aps = torch.tensor(aps, dtype=torch.float)
+
+    return aps
+
+def mAP(boxes_gt: torch.Tensor, labels_gt: torch.Tensor, boxes_pred: torch.Tensor, labels_pred: torch.Tensor, scores_pred: torch.Tensor, num_classes: int, iou_threshold: float=0.5, interpolate: bool=False) -> float:
+    """
+    mean Average Precisionを計算
+
+    Parameters
+    ----------
+    boxes_gt: torch.Tensor
+        正解bounding_box (2 dims)
+        バッチ内のすべてのbounding_boxを指定(クラスによらない)
+
+    labels_gt: torch.Tensor
+        正解ラベル (1 dims)
+        バッチ内のすべてのlabels指定(クラスによらない)
+
+    boxes_pred: torch.Tensor
+        予測bounding_box (2 dims)
+
+    labels_pred: torch.Tensor
+        予測ラベル (1 dims)
+    
+    scores_pred: torch.Tensor
+        予測信頼度 (1 dims)
+    
+    iou_threshold: float
+        iou threshold
+    
+    interpolate: bool
+        11点補完をするかどうか
+
+    Returns
+    -------
+    map: float
+        mean Average Precision
+    """
+
+    aps = AP(boxes_gt, labels_gt, boxes_pred, labels_pred, scores_pred, num_classes, iou_threshold, interpolate)
+    return torch.mean(aps)
